@@ -1,31 +1,22 @@
 #!/usr/bin/env python3
-"""Convert .doc, .docx, and .pdf files to Markdown.
+"""Convert .doc, .docx, .pdf, .xlsx, and .pptx files to Markdown.
 
-PDFs use pymupdf4llm (better layout/bold/lists, image extraction).
-Word docs use markitdown via LibreOffice (.doc -> .docx) then markitdown.
-Images are processed with mlx-vlm (Qwen2.5-VL) for optional alt text and text extraction.
+PDFs use pymupdf4llm for high-quality layout and image extraction.
+Word docs use markitdown via LibreOffice for conversion.
+Images are optionally processed with mlx-vlm for alt text and text extraction.
 
 Usage:
-    # Convert all files (DDS/, DRS/, Error Codes/, Message Specs V2.1/, MHX-MHub/, UserGuide/)
-    .venv/bin/python3 convert_to_md.py
+    # Convert all documents in current directory
+    python3 convert_to_md.py .
 
-    # Convert a specific directory
-    .venv/bin/python3 convert_to_md.py DDS/
-
-    # Convert a single file
-    .venv/bin/python3 convert_to_md.py "DDS/TN4.1 DDS - Liquor Tobacco/TN4.1 DDS - Liquor Tobacco (Rel1.0) UPD20130710.doc"
-
-    # Dry run — show what would be converted
-    .venv/bin/python3 convert_to_md.py --dry-run
-
-    # Force reconvert even if .md already exists
-    .venv/bin/python3 convert_to_md.py --force
+    # Convert a specific file
+    python3 convert_to_md.py document.docx
 
     # Generate image alt text using mlx-vlm
-    .venv/bin/python3 convert_to_md.py --describe-images
+    python3 convert_to_md.py --describe-images document.pdf
 
     # Extract text from images into sidecar .md files
-    .venv/bin/python3 convert_to_md.py --extract-image-text
+    python3 convert_to_md.py --extract-image-text document.docx
 """
 
 import argparse
@@ -49,12 +40,12 @@ from markitdown import MarkItDown
 
 
 OLLAMA_ALT_PROMPT = (
-    "Describe this screenshot from a technical user guide in one concise sentence, "
+    "Describe this image in one concise sentence, "
     "suitable for use as image alt text. Do not start with 'This image', 'The image' or 'A screenshot of'."
 )
 
 OLLAMA_EXTRACT_PROMPT = (
-    "Extract all visible text from this screenshot exactly as it appears, preserving structure. "
+    "Extract all visible text from this image exactly as it appears, preserving structure. "
     "Use markdown formatting: headings for labels, tables if tabular data is present, "
     "bullet points for lists. Output only the extracted text, no commentary."
 )
@@ -69,13 +60,7 @@ _mlx_is_stuck = False
 
 
 def describe_image(image_path: Path, model_and_processor: tuple, prompt: str = OLLAMA_ALT_PROMPT) -> str:
-    """Call mlx-vlm vision model with the given prompt. Returns the response text.
-    Returns empty string for images that are too small to be meaningful.
-
-    Thread-safety: serializes all generate() calls via _mlx_serialize so that a
-    timed-out daemon thread and a new call never run concurrently on Metal.  After
-    a timeout _mlx_is_stuck is set and all subsequent calls return "" immediately.
-    """
+    """Call mlx-vlm vision model with the given prompt. Returns the response text."""
     global _mlx_is_stuck
     if _mlx_is_stuck:
         return ""
@@ -106,7 +91,7 @@ def describe_image(image_path: Path, model_and_processor: tuple, prompt: str = O
         done = threading.Event()
 
         def _worker():
-            with _mlx_serialize:  # blocks if a previous call is still running
+            with _mlx_serialize:
                 try:
                     result[0] = generate(
                         model, processor,
@@ -115,14 +100,14 @@ def describe_image(image_path: Path, model_and_processor: tuple, prompt: str = O
                         max_tokens=IMAGE_MAX_TOKENS,
                         verbose=False,
                     )
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     exc[0] = e
             done.set()
 
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
         if not done.wait(timeout=IMAGE_TIMEOUT):
-            _mlx_is_stuck = True  # stuck thread still holds _mlx_serialize; skip all future images
+            _mlx_is_stuck = True
             raise RuntimeError(
                 f"mlx-vlm timed out ({IMAGE_TIMEOUT}s) for {image_path.name}; skipping remaining images"
             )
@@ -130,7 +115,6 @@ def describe_image(image_path: Path, model_and_processor: tuple, prompt: str = O
             raise exc[0]
 
         response = result[0]
-        # response is a GenerationResult object; extract text
         text = response.text if hasattr(response, 'text') else str(response)
         return text.strip()
     except Exception as e:
@@ -138,14 +122,10 @@ def describe_image(image_path: Path, model_and_processor: tuple, prompt: str = O
 
 
 def detect_header_footer_margins(doc: pymupdf.Document) -> tuple[float, float]:
-    """Detect header/footer heights by finding text blocks repeated across pages.
-
-    Returns (top_margin, bottom_margin) in points. Returns (0, 0) for single-page docs.
-    """
+    """Detect header/footer heights by finding text blocks repeated across pages."""
     if len(doc) < 2:
         return 0.0, 0.0
 
-    # Collect text blocks per page: (y0, y1, text)
     per_page: list[tuple[float, list[tuple[float, float, str]]]] = []
     for page in doc:
         h = page.rect.height
@@ -156,21 +136,19 @@ def detect_header_footer_margins(doc: pymupdf.Document) -> tuple[float, float]:
         ]
         per_page.append((h, blocks))
 
-    # Count how many pages each text snippet appears on
     from collections import Counter
     text_count: Counter = Counter()
-    text_pos: dict[str, tuple[float, float, float]] = {}  # key -> (y0, y1, page_height)
+    text_pos: dict[str, tuple[float, float, float]] = {}
     for h, blocks in per_page:
         seen = set()
         for y0, y1, text in blocks:
-            key = text.split("\n")[0][:80]  # first line only — avoids page-number suffix
+            key = text.split("\n")[0][:80]
             if key and key not in seen:
                 text_count[key] += 1
                 seen.add(key)
             if key and key not in text_pos:
                 text_pos[key] = (y0, y1, h)
 
-    # Text on 50%+ of pages and in top/bottom 20% of page → header/footer
     threshold = max(2, len(per_page) // 2)
     top_margin = 0.0
     bottom_margin = 0.0
@@ -187,7 +165,7 @@ def detect_header_footer_margins(doc: pymupdf.Document) -> tuple[float, float]:
 
 
 def redact_header_footer(src: Path, dst: Path) -> None:
-    """Redact header and footer zones from every page of a PDF (auto-detected)."""
+    """Redact header and footer zones from every page of a PDF."""
     doc = pymupdf.open(str(src))
     top_pts, bottom_pts = detect_header_footer_margins(doc)
     if top_pts == 0 and bottom_pts == 0:
@@ -222,14 +200,12 @@ def xlsx_to_md(src: Path) -> str:
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
         rows = list(ws.iter_rows(values_only=True))
-        # strip trailing all-None rows
         while rows and all(v is None for v in rows[-1]):
             rows.pop()
         if not rows:
             parts.append(f"## {sheet_name}\n\n*(empty)*")
             continue
 
-        # determine column count from widest row
         ncols = max(len(r) for r in rows)
 
         def _cell(v) -> str:
@@ -258,20 +234,43 @@ def xlsx_to_md(src: Path) -> str:
 
 
 _CONFIG_PATH = Path(__file__).parent / "config.json"
-_DEFAULT_PATHS = ["DRS", "Error Codes", "Message Specs V2.1", "MHX-MHub", "DDS", "UserGuide", "TN4.1 FE Vendor Guide"]
 
 
 def _load_config_paths() -> list[str]:
     if _CONFIG_PATH.exists():
-        with _CONFIG_PATH.open() as f:
-            data = json.load(f)
-        return data.get("paths", _DEFAULT_PATHS)
-    return _DEFAULT_PATHS
+        try:
+            with _CONFIG_PATH.open() as f:
+                data = json.load(f)
+            return data.get("paths", [])
+        except Exception:
+            pass
+    return []
 
 
-SOFFICE = os.environ.get("SOFFICE_PATH", "/Applications/LibreOffice.app/Contents/MacOS/soffice")
+def find_soffice() -> str:
+    """Try to find the LibreOffice 'soffice' executable."""
+    if "SOFFICE_PATH" in os.environ:
+        return os.environ["SOFFICE_PATH"]
+
+    common_paths = [
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        "/usr/bin/soffice",
+        "/usr/local/bin/soffice",
+        "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
+        "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
+    ]
+    for path in common_paths:
+        if os.path.exists(path):
+            return path
+    
+    path_cmd = shutil.which("soffice")
+    if path_cmd:
+        return path_cmd
+        
+    return "soffice"
 
 
+SOFFICE = find_soffice()
 SOFFICE_TIMEOUT = int(os.environ.get("SOFFICE_TIMEOUT", "120"))
 
 IMAGE_TIMEOUT = int(os.environ.get("IMAGE_TIMEOUT", "120"))
@@ -310,25 +309,22 @@ def get_header_footer_media(z: ZipFile) -> set[str]:
             continue
         try:
             tree = ET.fromstring(z.read(rels_path))
-            part_dir = part.rsplit("/", 1)[0] + "/"  # e.g. "word/"
+            part_dir = part.rsplit("/", 1)[0] + "/"
             for rel in tree:
                 target = rel.get("Target", "")
                 if "media/" in target:
-                    # resolve relative to part's directory
                     hf_media.add(part_dir + target.lstrip("/").replace("../", ""))
         except ET.ParseError:
             pass
     return hf_media
 
 
-# Formats Ollama vision models cannot handle — will be converted to PNG
 _VECTOR_EXTS = {".wmf", ".emf", ".svg"}
-# Formats safe to send to Ollama
 _RASTER_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 
 
 def _to_png(data: bytes, src_ext: str) -> bytes | None:
-    """Convert vector image bytes to PNG using pymupdf. Returns None on failure."""
+    """Convert vector image bytes to PNG using pymupdf."""
     try:
         doc = pymupdf.open(stream=data, filetype=src_ext.lstrip("."))
         pix = doc[0].get_pixmap(dpi=150)
@@ -338,9 +334,7 @@ def _to_png(data: bytes, src_ext: str) -> bytes | None:
 
 
 def extract_images_from_docx(docx_path: Path, img_dir: Path, md_dir: Path) -> list[str]:
-    """Extract body images from a docx into img_dir, skipping header/footer images.
-    Vector formats (wmf/emf/svg) are converted to PNG.
-    Returns paths relative to md_dir (e.g. images/doc-slug/001.png)."""
+    """Extract body images from a docx, skipping header/footer images."""
     image_paths = []
     with ZipFile(docx_path) as z:
         hf_media = get_header_footer_media(z)
@@ -357,7 +351,7 @@ def extract_images_from_docx(docx_path: Path, img_dir: Path, md_dir: Path) -> li
                     filename = f"{i:03d}.png"
                     (img_dir / filename).write_bytes(png_data)
                 else:
-                    continue  # skip unconvertible vector images
+                    continue
             else:
                 filename = f"{i:03d}{ext}"
                 (img_dir / filename).write_bytes(data)
@@ -378,13 +372,7 @@ _CONTENT_TYPE_EXT = {
 
 
 def extract_images_from_pptx(pptx_path: Path, img_dir: Path, md_dir: Path) -> dict[str, str]:
-    """Extract images from a pptx using python-pptx, keyed by markitdown's synthesised filename.
-
-    markitdown generates image refs as ``re.sub(r"\\W", "", shape.name) + ".jpg"``
-    regardless of the real image format.  We extract the actual blob with its real
-    extension and return {markitdown_ref → real_relative_path} so the caller can
-    replace the broken references in the markdown.
-    """
+    """Extract images from a pptx, keyed by markitdown's filename."""
     import pptx as _pptx
     import pptx.enum.shapes as _shapes
 
@@ -398,7 +386,7 @@ def extract_images_from_pptx(pptx_path: Path, img_dir: Path, md_dir: Path) -> di
             or (shape.shape_type == _shapes.MSO_SHAPE_TYPE.PLACEHOLDER and hasattr(shape, "image"))
         )
         if is_pic:
-            ref_name = re.sub(r"\W", "", shape.name) + ".jpg"  # matches markitdown exactly
+            ref_name = re.sub(r"\W", "", shape.name) + ".jpg"
             if ref_name not in mapping:
                 ct = (shape.image.content_type or "image/png").lower().split(";")[0].strip()
                 real_ext = _CONTENT_TYPE_EXT.get(ct, ".png")
@@ -427,7 +415,7 @@ def extract_images_from_pptx(pptx_path: Path, img_dir: Path, md_dir: Path) -> di
 
 
 def replace_image_placeholders(md_text: str, image_paths: list[str]) -> str:
-    """Replace data:image/...base64... placeholders with extracted file paths."""
+    """Replace base64 placeholders with extracted file paths."""
     idx = 0
 
     def _replace(m: re.Match) -> str:
@@ -437,13 +425,13 @@ def replace_image_placeholders(md_text: str, image_paths: list[str]) -> str:
             path = image_paths[idx]
             idx += 1
             return f"![{alt}]({path})"
-        return m.group(0)  # no more images, keep placeholder
+        return m.group(0)
 
     return PLACEHOLDER_RE.sub(_replace, md_text)
 
 
 def _apply_vision_model(final_img: Path, img_desc_fn, img_extract_fn) -> str:
-    """Generate alt text and/or write sidecar .md for an image. Returns alt text."""
+    """Generate alt text and/or write sidecar .md for an image."""
     alt = ""
     if img_desc_fn is not None:
         try:
@@ -463,7 +451,7 @@ def _apply_vision_model(final_img: Path, img_desc_fn, img_extract_fn) -> str:
 
 
 def convert_file(md_converter: MarkItDown, src: Path, dest: Path, tmp_dir: Path, img_desc_fn=None, img_extract_fn=None, workers: int = 1) -> dict:
-    """Convert a single Word or PDF file to Markdown. Returns status dict."""
+    """Convert a single document file to Markdown."""
     try:
         suffix = src.suffix.lower()
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -476,7 +464,6 @@ def convert_file(md_converter: MarkItDown, src: Path, dest: Path, tmp_dir: Path,
             clean_pdf = tmp_dir / src.name
             redact_header_footer(src, clean_pdf)
 
-            # write images to a per-file temp subdir to avoid name collisions
             file_hash = hashlib.md5(src.stem.encode()).hexdigest()[:6]
             tmp_img_dir = (tmp_dir / file_hash).resolve()
             tmp_img_dir.mkdir(exist_ok=True)
@@ -487,8 +474,7 @@ def convert_file(md_converter: MarkItDown, src: Path, dest: Path, tmp_dir: Path,
                 image_format="png",
             )
 
-            # rename images to short names in order of appearance in markdown
-            seen: dict[str, str] = {}  # abs_path -> images/doc_slug/short_name
+            seen: dict[str, str] = {}
             img_count = 0
             for m in re.finditer(r'\]\(([^)]+\.png)\)', md_text):
                 abs_path = m.group(1)
@@ -501,12 +487,11 @@ def convert_file(md_converter: MarkItDown, src: Path, dest: Path, tmp_dir: Path,
                     src_img.rename(img_dir / new_name)
                 seen[abs_path] = f"images/{doc_slug}/{new_name}"
 
-            # replace paths and optionally add alt text / extract text via vision model
             def _process_pdf_img(item: tuple[str, str]) -> tuple[str, str, str | None]:
                 abs_path, rel_path = item
                 final_img = img_dir / Path(rel_path).name
                 if final_img.suffix.lower() not in _RASTER_EXTS:
-                    return abs_path, rel_path, None  # None = non-raster, just repath
+                    return abs_path, rel_path, None
                 return abs_path, rel_path, _apply_vision_model(final_img, img_desc_fn, img_extract_fn)
 
             _show_img_progress = (img_desc_fn is not None or img_extract_fn is not None) and bool(seen)
@@ -531,7 +516,6 @@ def convert_file(md_converter: MarkItDown, src: Path, dest: Path, tmp_dir: Path,
             shutil.rmtree(img_dir, ignore_errors=True)
             img_mapping = extract_images_from_pptx(src, img_dir, dest.parent)
             md_text = result.text_content
-            # markitdown references images by their original basename — repath to extracted location
             for orig_name, new_path in img_mapping.items():
                 md_text = md_text.replace(f"]({orig_name})", f"]({new_path})")
             image_paths = list(img_mapping.values())
@@ -568,7 +552,6 @@ def convert_file(md_converter: MarkItDown, src: Path, dest: Path, tmp_dir: Path,
             if suffix == ".doc":
                 docx_path.unlink(missing_ok=True)
 
-            # apply vision model to docx images
             def _process_docx_img(rel_path: str) -> tuple[str, str]:
                 final_img = dest.parent / rel_path
                 if not final_img.exists() or final_img.suffix.lower() not in _RASTER_EXTS:
@@ -595,17 +578,17 @@ def convert_file(md_converter: MarkItDown, src: Path, dest: Path, tmp_dir: Path,
 
 
 def normalize_stem(stem: str) -> str:
-    """Normalize a filename stem to a URL-safe, shell-friendly slug."""
-    s = re.sub(r'[()[\]{}]', '', stem)  # remove brackets
-    s = s.replace('&', '-')             # & → -
-    s = re.sub(r'[ _]', '-', s)         # spaces/underscores → -
-    s = re.sub(r'\.', '-', s)           # dots → -
-    s = re.sub(r'-+', '-', s)           # collapse runs
+    """Normalize a filename stem to a URL-safe slug."""
+    s = re.sub(r'[()[\]{}]', '', stem)
+    s = s.replace('&', '-')
+    s = re.sub(r'[ _]', '-', s)
+    s = re.sub(r'\.', '-', s)
+    s = re.sub(r'-+', '-', s)
     return s.strip('-').lower()
 
 
 def md_output_path(src: Path, output_dir: Path | None = None) -> Path:
-    """Determine .md output path, optionally rooted under output_dir."""
+    """Determine .md output path."""
     rel = src.with_name(normalize_stem(src.stem) + ".md")
     if output_dir is not None:
         return output_dir / rel
@@ -613,23 +596,26 @@ def md_output_path(src: Path, output_dir: Path | None = None) -> Path:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert Word documents to Markdown")
+    parser = argparse.ArgumentParser(description="Convert documents to Markdown")
     parser.add_argument(
         "paths",
         nargs="*",
         default=None,
-        help="Files or directories to convert (default: paths from convert_scripts/config.json)",
+        help="Files or directories to convert (default: search current directory)",
     )
     parser.add_argument("--dry-run", action="store_true", help="Show what would be converted")
     parser.add_argument("--force", action="store_true", help="Reconvert even if .md exists")
-    parser.add_argument("--output-dir", metavar="DIR", default="out", help="Root output directory (mirrors source structure, default: out/)")
-    parser.add_argument("--describe-images", action="store_true", help="Use mlx-vlm vision model to generate image alt text")
-    parser.add_argument("--extract-image-text", action="store_true", help="Use mlx-vlm vision model to extract text from each image into a sidecar .md file")
-    parser.add_argument("--workers", type=int, default=1, metavar="N", help="Parallel image-processing workers per file (default: 1)")
-    parser.add_argument("--images-only", action="store_true", help="Skip document conversion; only run vision model on existing images")
+    parser.add_argument("--output-dir", metavar="DIR", default="out", help="Root output directory (default: out/)")
+    parser.add_argument("--describe-images", action="store_true", help="Use mlx-vlm to generate image alt text")
+    parser.add_argument("--extract-image-text", action="store_true", help="Use mlx-vlm to extract text from images")
+    parser.add_argument("--workers", type=int, default=1, metavar="N", help="Parallel image-processing workers (default: 1)")
+    parser.add_argument("--images-only", action="store_true", help="Only run vision model on existing images")
     args = parser.parse_args()
+    
     if not args.paths:
         args.paths = _load_config_paths()
+    if not args.paths:
+        args.paths = ["."]
 
     output_dir = Path(args.output_dir)
 
@@ -639,11 +625,12 @@ def main():
     if args.describe_images or args.extract_image_text:
         from functools import partial
         try:
-            print("Loading mlx-vlm Qwen2.5-VL-7B-Instruct-4bit ...", flush=True)
+            print("Loading mlx-vlm model ...", flush=True)
             from mlx_vlm import load
             from mlx_vlm.utils import load_config
-            model, processor = load("mlx-community/Qwen2.5-VL-7B-Instruct-4bit")
-            config = load_config("mlx-community/Qwen2.5-VL-7B-Instruct-4bit")
+            model_id = "mlx-community/Qwen2.5-VL-7B-Instruct-4bit"
+            model, processor = load(model_id)
+            config = load_config(model_id)
             model_and_processor = (model, processor, config)
             print("Model loaded successfully")
         except Exception as e:
@@ -654,7 +641,6 @@ def main():
         if args.extract_image_text:
             img_extract_fn = partial(describe_image, model_and_processor=model_and_processor, prompt=OLLAMA_EXTRACT_PROMPT)
 
-    # Collect files
     files: list[Path] = []
     for p in args.paths:
         path = Path(p)
@@ -666,10 +652,9 @@ def main():
             print(f"Warning: {p} not found, skipping", file=sys.stderr)
 
     if not files:
-        print("No Word files found.")
+        print("No document files found.")
         return
 
-    # Filter already-converted unless --force
     to_convert = []
     already_done = []
     skipped = 0
@@ -685,7 +670,7 @@ def main():
         already_done.extend(to_convert)
         to_convert = []
 
-    print(f"Found {len(files)} Word files, {len(to_convert)} to convert, {skipped} already done")
+    print(f"Found {len(files)} files, {len(to_convert)} to convert, {skipped} already done")
 
     if args.dry_run:
         for src, dest in to_convert:
@@ -722,7 +707,6 @@ def main():
         for e in errors:
             print(f"  {e['src']}: {e['error']}")
 
-    # For already-converted docs, process any missing image sidecars
     if img_extract_fn is not None and already_done:
         pending = [
             (src, dest) for src, dest in already_done
@@ -732,7 +716,7 @@ def main():
             )
         ]
         if pending:
-            print(f"\nProcessing image sidecars for {len(pending)} already-converted files ...")
+            print(f"\nProcessing image sidecars for {len(pending)} files ...")
             for src, dest in pending:
                 img_dir = dest.parent / "images" / normalize_stem(src.stem)
                 imgs = sorted(

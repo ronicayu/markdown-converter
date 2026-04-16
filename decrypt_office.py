@@ -5,17 +5,11 @@ Uses msoffcrypto-tool. Tries passwords in order: empty string, then any
 supplied via --password. Decrypted files replace the originals.
 
 Usage:
-    # Decrypt all encrypted files under DDS/ and DRS/
-    .venv/bin/python3 convert_scripts/decrypt_office.py
-
-    # Decrypt a specific directory
-    .venv/bin/python3 convert_scripts/decrypt_office.py DRS/
+    # Decrypt all encrypted files in current directory
+    python3 decrypt_office.py .
 
     # Decrypt with a known password
-    .venv/bin/python3 convert_scripts/decrypt_office.py --password secret123
-
-    # Dry run — show which files are encrypted
-    .venv/bin/python3 convert_scripts/decrypt_office.py --dry-run
+    python3 decrypt_office.py . --password secret123
 """
 
 import argparse
@@ -45,7 +39,7 @@ def is_encrypted(path: Path) -> bool:
 
 
 def decrypt_file(path: Path, passwords: list[str]) -> str | None:
-    """Try to decrypt a file in-place. Returns None on success, error string on failure."""
+    """Try to decrypt a file in-place."""
     for pw in passwords:
         try:
             with open(path, "rb") as f:
@@ -58,7 +52,8 @@ def decrypt_file(path: Path, passwords: list[str]) -> str | None:
             return None
         except Exception:
             try:
-                tmp_path.unlink(missing_ok=True)
+                if 'tmp_path' in locals():
+                    tmp_path.unlink(missing_ok=True)
             except Exception:
                 pass
             continue
@@ -68,22 +63,21 @@ def decrypt_file(path: Path, passwords: list[str]) -> str | None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Decrypt password-protected Office files in-place")
+    parser = argparse.ArgumentParser(description="Decrypt Office files in-place")
     parser.add_argument(
         "paths",
         nargs="*",
-        default=["DRS", "Error Codes", "Message Specs V2.1", "MHX-MHub", "DDS", "UserGuide"],
-        help="Files or directories to scan (default: DDS/ DRS/ Error Codes/ Message Specs V2.1/ MHX-MHub/ UserGuide/)",
+        default=["."],
+        help="Files or directories to scan (default: current directory)",
     )
-    parser.add_argument("--password", action="append", metavar="PW", help="Password(s) to try (empty string always tried first)")
-    parser.add_argument("--dry-run", action="store_true", help="Only list encrypted files, don't decrypt")
+    parser.add_argument("--password", action="append", metavar="PW", help="Password(s) to try")
+    parser.add_argument("--dry-run", action="store_true", help="Only list encrypted files")
     args = parser.parse_args()
 
     passwords = [""]
     if args.password:
         passwords.extend(p for p in args.password if p != "")
 
-    # Collect files
     files: list[Path] = []
     for p in args.paths:
         path = Path(p)
@@ -98,7 +92,6 @@ def main():
         print("No Office files found.")
         return
 
-    # Find encrypted files
     encrypted = [f for f in files if is_encrypted(f)]
     print(f"Found {len(files)} Office files, {len(encrypted)} encrypted")
 
