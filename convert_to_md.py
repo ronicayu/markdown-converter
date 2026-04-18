@@ -450,6 +450,59 @@ def _apply_vision_model(final_img: Path, img_desc_fn, img_extract_fn) -> str:
     return alt
 
 
+def is_pdf_scanned(pdf_path: Path) -> bool:
+    """Check if a PDF is likely a scanned document (little to no selectable text)."""
+    try:
+        doc = pymupdf.open(str(pdf_path))
+        text_content = ""
+        for i in range(min(5, len(doc))):  # check first 5 pages
+            text_content += doc[i].get_text().strip()
+        doc.close()
+        # If very little text is found across first few pages, assume it's scanned
+        return len(text_content) < 100
+    except Exception:
+        return False
+
+
+def convert_scanned_pdf(src: Path, dest: Path, img_extract_fn, workers: int = 1) -> dict:
+    """Convert a scanned PDF to Markdown by running vision model on each page."""
+    try:
+        doc = pymupdf.open(str(src))
+        doc_slug = normalize_stem(src.stem)
+        img_dir = dest.parent / "images" / doc_slug
+        shutil.rmtree(img_dir, ignore_errors=True)
+        img_dir.mkdir(parents=True, exist_ok=True)
+        
+        pages_md = [None] * len(doc)
+        
+        def _process_page(i: int) -> tuple[int, str]:
+            page = doc[i]
+            pix = page.get_pixmap(dpi=150)
+            img_path = img_dir / f"page_{i+1:03d}.png"
+            pix.save(str(img_path))
+            
+            md = img_extract_fn(img_path)
+            # Prepend page marker
+            return i, f"<!-- Page {i+1} -->\n\n{md}\n\n"
+
+        print(f" [scanned, {len(doc)} pages]", end="", flush=True)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_process_page, i) for i in range(len(doc))]
+            n_done = 0
+            for fut in as_completed(futures):
+                n_done += 1
+                print(f" [{n_done}/{len(doc)}]", end="", flush=True)
+                idx, md = fut.result()
+                pages_md[idx] = md
+        
+        doc.close()
+        final_md = "".join(pages_md)
+        dest.write_text(final_md, encoding="utf-8")
+        return {"status": "ok", "src": src, "dest": dest, "size": len(final_md), "images": len(doc)}
+    except Exception as e:
+        return {"status": "error", "src": src, "dest": dest, "error": f"Scanned conversion failed: {e}"}
+
+
 def convert_file(md_converter: MarkItDown, src: Path, dest: Path, tmp_dir: Path, img_desc_fn=None, img_extract_fn=None, workers: int = 1) -> dict:
     """Convert a single document file to Markdown."""
     try:
@@ -457,6 +510,11 @@ def convert_file(md_converter: MarkItDown, src: Path, dest: Path, tmp_dir: Path,
         dest.parent.mkdir(parents=True, exist_ok=True)
 
         if suffix == ".pdf":
+            if is_pdf_scanned(src):
+                if img_extract_fn is None:
+                    return {"status": "error", "src": src, "dest": dest, "error": "Scanned PDF detected but vision model not loaded. Run with --extract-image-text or ensure mlx-vlm is available."}
+                return convert_scanned_pdf(src, dest, img_extract_fn, workers)
+
             doc_slug = normalize_stem(src.stem)
             img_dir = dest.parent / "images" / doc_slug
             shutil.rmtree(img_dir, ignore_errors=True)
@@ -619,28 +677,6 @@ def main():
 
     output_dir = Path(args.output_dir)
 
-    img_desc_fn = None
-    img_extract_fn = None
-    model_and_processor = None
-    if args.describe_images or args.extract_image_text:
-        from functools import partial
-        try:
-            print("Loading mlx-vlm model ...", flush=True)
-            from mlx_vlm import load
-            from mlx_vlm.utils import load_config
-            model_id = "mlx-community/Qwen2.5-VL-7B-Instruct-4bit"
-            model, processor = load(model_id)
-            config = load_config(model_id)
-            model_and_processor = (model, processor, config)
-            print("Model loaded successfully")
-        except Exception as e:
-            print(f"Error loading mlx-vlm: {e}", file=sys.stderr)
-            sys.exit(1)
-        if args.describe_images:
-            img_desc_fn = partial(describe_image, model_and_processor=model_and_processor)
-        if args.extract_image_text:
-            img_extract_fn = partial(describe_image, model_and_processor=model_and_processor, prompt=OLLAMA_EXTRACT_PROMPT)
-
     files: list[Path] = []
     for p in args.paths:
         path = Path(p)
@@ -658,6 +694,7 @@ def main():
     to_convert = []
     already_done = []
     skipped = 0
+    has_scanned_pdf = False
     for f in files:
         dest = md_output_path(f, output_dir)
         if dest.exists() and not args.force:
@@ -665,12 +702,41 @@ def main():
             already_done.append((f, dest))
         else:
             to_convert.append((f, dest))
+            if f.suffix.lower() == ".pdf" and is_pdf_scanned(f):
+                has_scanned_pdf = True
 
     if args.images_only:
         already_done.extend(to_convert)
         to_convert = []
 
     print(f"Found {len(files)} files, {len(to_convert)} to convert, {skipped} already done")
+
+    img_desc_fn = None
+    img_extract_fn = None
+    model_and_processor = None
+    
+    # Load vision model if explicitly requested OR if we have scanned PDFs to process
+    if args.describe_images or args.extract_image_text or has_scanned_pdf:
+        from functools import partial
+        try:
+            print("Loading mlx-vlm model ...", flush=True)
+            from mlx_vlm import load
+            from mlx_vlm.utils import load_config
+            model_id = "mlx-community/Qwen2.5-VL-7B-Instruct-4bit"
+            model, processor = load(model_id)
+            config = load_config(model_id)
+            model_and_processor = (model, processor, config)
+            print("Model loaded successfully")
+        except Exception as e:
+            print(f"Error loading mlx-vlm: {e}", file=sys.stderr)
+            sys.exit(1)
+            
+        if args.describe_images:
+            img_desc_fn = partial(describe_image, model_and_processor=model_and_processor)
+        
+        # img_extract_fn is required for scanned PDFs even if --extract-image-text is not passed
+        if args.extract_image_text or has_scanned_pdf:
+            img_extract_fn = partial(describe_image, model_and_processor=model_and_processor, prompt=OLLAMA_EXTRACT_PROMPT)
 
     if args.dry_run:
         for src, dest in to_convert:
